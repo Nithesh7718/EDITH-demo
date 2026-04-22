@@ -134,9 +134,12 @@ Copy `.env.example` → `.env` and fill in the values below.
 Open `agent_friday.py` and change the provider constants at the top:
 
 ```python
-STT_PROVIDER = "sarvam"   # "sarvam" | "whisper"
-LLM_PROVIDER = "gemini"   # "gemini" | "openai"
-TTS_PROVIDER = "openai"   # "openai" | "sarvam"
+STT_PROVIDER = "sarvam"                     # "sarvam" | "whisper"
+LLM_FALLBACK_ORDER = ("groq", "gemini", "openai")  # auto-switch on failure
+TTS_FALLBACK_ORDER = ("windows", "openai")  # auto-switch on failure
+
+# The agent now uses LiveKit fallback adapters. If one LLM/TTS backend fails,
+# it automatically moves to the next backend in the order above.
 ```
 
 ---

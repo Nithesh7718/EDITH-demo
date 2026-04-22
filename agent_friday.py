@@ -12,27 +12,42 @@ Run:
   uv run agent_friday.py console  – text-only console mode
 """
 
-import os
+import asyncio
 import logging
+import os
 import subprocess
+import tempfile
+import uuid
+import wave
+import shutil
+from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
+from livekit.agents.tts import (
+    AudioEmitter,
+    ChunkedStream,
+    FallbackAdapter as TTSFallbackAdapter,
+    TTSCapabilities,
+    TTS,
+)
 from livekit.agents.voice import Agent, AgentSession
-from livekit.agents.llm import mcp
+from livekit.agents.llm import FallbackAdapter as LLMFallbackAdapter, mcp
 
 # Plugins
-from livekit.plugins import google as lk_google, openai as lk_openai, sarvam, silero
+from livekit.plugins import google as lk_google, groq as lk_groq, openai as lk_openai, sarvam, silero
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
 STT_PROVIDER       = "sarvam"
-LLM_PROVIDER       = "gemini"
-TTS_PROVIDER       = "openai"
+
+LLM_FALLBACK_ORDER  = ("groq", "gemini", "openai")
+TTS_FALLBACK_ORDER  = ("windows", "openai")
 
 GEMINI_LLM_MODEL   = "gemini-2.5-flash"
+GROQ_LLM_MODEL     = "llama-3.3-70b-versatile"
 OPENAI_LLM_MODEL   = "gpt-4o"
 
 OPENAI_TTS_MODEL   = "tts-1"
@@ -41,6 +56,8 @@ TTS_SPEED           = 1.15
 
 SARVAM_TTS_LANGUAGE = "en-IN"
 SARVAM_TTS_SPEAKER  = "rahul"
+
+WINDOWS_TTS_VOICE   = None  # Use the system default voice
 
 # MCP server running on Windows host
 MCP_SERVER_PORT = 8000
@@ -217,31 +234,154 @@ def _build_stt():
         raise ValueError(f"Unknown STT_PROVIDER: {STT_PROVIDER!r}")
 
 
-def _build_llm():
-    if LLM_PROVIDER == "openai":
-        logger.info("LLM → OpenAI (%s)", OPENAI_LLM_MODEL)
+def _build_llm_backend(provider: str):
+    def _require_key(env_name: str) -> str:
+        value = (os.getenv(env_name) or "").strip()
+        if not value:
+            raise RuntimeError(f"missing {env_name}")
+        return value
+
+    if provider == "openai":
+        _require_key("OPENAI_API_KEY")
+        logger.info("LLM backend → OpenAI (%s)", OPENAI_LLM_MODEL)
         return lk_openai.LLM(model=OPENAI_LLM_MODEL)
-    elif LLM_PROVIDER == "gemini":
-        logger.info("LLM → Google Gemini (%s)", GEMINI_LLM_MODEL)
-        return lk_google.LLM(model=GEMINI_LLM_MODEL, api_key=os.getenv("GOOGLE_API_KEY"))
-    else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}")
+    if provider == "gemini":
+        api_key = _require_key("GOOGLE_API_KEY")
+        logger.info("LLM backend → Google Gemini (%s)", GEMINI_LLM_MODEL)
+        return lk_google.LLM(model=GEMINI_LLM_MODEL, api_key=api_key)
+    if provider == "groq":
+        _require_key("GROQ_API_KEY")
+        logger.info("LLM backend → Groq (%s)", GROQ_LLM_MODEL)
+        return lk_groq.LLM(model=GROQ_LLM_MODEL)
+    raise ValueError(f"Unknown LLM backend: {provider!r}")
 
 
-def _build_tts():
-    if TTS_PROVIDER == "sarvam":
-        logger.info("TTS → Sarvam Bulbul v3")
+def _build_llm():
+    llm_backends = []
+    enabled_backends = []
+    for provider in LLM_FALLBACK_ORDER:
+        try:
+            llm_backends.append(_build_llm_backend(provider))
+            enabled_backends.append(provider)
+        except Exception as exc:
+            logger.warning("Skipping LLM backend %s: %s", provider, exc)
+
+    if not llm_backends:
+        raise RuntimeError(
+            "No usable LLM backends available. Configure at least one of "
+            "GOOGLE_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY."
+        )
+
+    logger.info("LLM → automatic fallback: %s", " -> ".join(enabled_backends))
+    return LLMFallbackAdapter(
+        llm_backends,
+        attempt_timeout=15.0,
+        max_retry_per_llm=2,
+        retry_interval=1.0,
+    )
+
+
+def _build_tts_backend(provider: str):
+    if provider == "windows":
+        logger.info("TTS backend → Windows built-in speech")
+        return WindowsTTS()
+    if provider == "sarvam":
+        logger.info("TTS backend → Sarvam Bulbul v3")
         return sarvam.TTS(
             target_language_code=SARVAM_TTS_LANGUAGE,
             model="bulbul:v3",
             speaker=SARVAM_TTS_SPEAKER,
             pace=TTS_SPEED,
         )
-    elif TTS_PROVIDER == "openai":
-        logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
+    if provider == "openai":
+        logger.info("TTS backend → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
         return lk_openai.TTS(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, speed=TTS_SPEED)
-    else:
-        raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+    raise ValueError(f"Unknown TTS backend: {provider!r}")
+
+
+def _build_tts():
+    tts_backends = [_build_tts_backend(provider) for provider in TTS_FALLBACK_ORDER]
+    logger.info("TTS → automatic fallback: %s", " -> ".join(TTS_FALLBACK_ORDER))
+    return TTSFallbackAdapter(tts_backends, max_retry_per_tts=0)
+
+
+def _synthesize_windows_wave(text: str) -> Path:
+    if not text.strip():
+        raise ValueError("Windows TTS received empty text")
+
+    output_file = Path(tempfile.gettempdir()) / f"friday_tts_{uuid.uuid4().hex}.wav"
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        raise RuntimeError("Neither pwsh nor powershell is available for Windows TTS")
+
+    script = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+    if ($env:FRIDAY_TTS_VOICE) {
+        $synth.SelectVoice($env:FRIDAY_TTS_VOICE)
+    }
+    $synth.SetOutputToWaveFile($env:FRIDAY_TTS_OUT)
+    $synth.Speak($env:FRIDAY_TTS_TEXT)
+}
+finally {
+    $synth.Dispose()
+}
+'''
+
+    env = os.environ.copy()
+    env["FRIDAY_TTS_TEXT"] = text
+    env["FRIDAY_TTS_OUT"] = str(output_file)
+    env["FRIDAY_TTS_VOICE"] = WINDOWS_TTS_VOICE or ""
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Windows TTS synthesis failed: "
+            f"{result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
+        )
+
+    if not output_file.exists() or output_file.stat().st_size == 0:
+        raise RuntimeError("Windows TTS did not produce any audio")
+
+    return output_file
+
+
+class WindowsTTSStream(ChunkedStream):
+    async def _run(self, output_emitter: AudioEmitter) -> None:
+        wav_path = await asyncio.to_thread(_synthesize_windows_wave, self._input_text)
+        try:
+            with wave.open(str(wav_path), "rb") as wav_file:
+                output_emitter.initialize(
+                    request_id=uuid.uuid4().hex,
+                    sample_rate=wav_file.getframerate(),
+                    num_channels=wav_file.getnchannels(),
+                    mime_type="audio/wav",
+                )
+
+            output_emitter.push(wav_path.read_bytes())
+            output_emitter.flush()
+        finally:
+            wav_path.unlink(missing_ok=True)
+
+
+class WindowsTTS(TTS):
+    def __init__(self) -> None:
+        super().__init__(
+            capabilities=TTSCapabilities(streaming=False),
+            sample_rate=22050,
+            num_channels=1,
+        )
+
+    def synthesize(self, text: str, conn_options=None) -> ChunkedStream:
+        return WindowsTTSStream(tts=self, input_text=text, conn_options=conn_options)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +454,10 @@ def _endpointing_delay() -> float:
 async def entrypoint(ctx: JobContext) -> None:
     logger.info(
         "FRIDAY online – room: %s | STT=%s | LLM=%s | TTS=%s",
-        ctx.room.name, STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
+        ctx.room.name,
+        STT_PROVIDER,
+        " -> ".join(LLM_FALLBACK_ORDER),
+        " -> ".join(TTS_FALLBACK_ORDER),
     )
 
     stt = _build_stt()
